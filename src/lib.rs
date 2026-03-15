@@ -25,8 +25,8 @@ mod private {
         },
         rfc8410::ID_ED_25519,
     };
-    use ring::digest;
     use rustls::pki_types::ServerName;
+    use sha2::Digest as _;
     use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
     use tokio_postgres::tls::{ChannelBinding, TlsConnect};
     use tokio_rustls::{client::TlsStream, TlsConnector};
@@ -80,28 +80,27 @@ mod private {
             match session.peer_certificates() {
                 Some(certs) if !certs.is_empty() => Certificate::from_der(&certs[0])
                     .ok()
-                    .and_then(|cert| {
-                        let digest = match cert.signature_algorithm.oid {
-                            // Note: SHA1 is upgraded to SHA256 as per https://datatracker.ietf.org/doc/html/rfc5929#section-4.1
+                    .map_or_else(ChannelBinding::none, |cert| {
+                        let der = certs[0].as_ref();
+                        // Note: SHA1 is upgraded to SHA256 as per https://datatracker.ietf.org/doc/html/rfc5929#section-4.1
+                        let hash: Option<Vec<u8>> = match cert.signature_algorithm.oid {
                             ID_SHA_1
                             | ID_SHA_256
                             | SHA_1_WITH_RSA_ENCRYPTION
                             | SHA_256_WITH_RSA_ENCRYPTION
-                            | ECDSA_WITH_SHA_256 => &digest::SHA256,
+                            | ECDSA_WITH_SHA_256 => Some(sha2::Sha256::digest(der).to_vec()),
                             ID_SHA_384 | SHA_384_WITH_RSA_ENCRYPTION | ECDSA_WITH_SHA_384 => {
-                                &digest::SHA384
+                                Some(sha2::Sha384::digest(der).to_vec())
                             }
                             ID_SHA_512 | SHA_512_WITH_RSA_ENCRYPTION | ID_ED_25519 => {
-                                &digest::SHA512
+                                Some(sha2::Sha512::digest(der).to_vec())
                             }
-                            _ => return None,
+                            _ => None,
                         };
-
-                        Some(digest)
-                    })
-                    .map_or_else(ChannelBinding::none, |algorithm| {
-                        let hash = digest::digest(algorithm, certs[0].as_ref());
-                        ChannelBinding::tls_server_end_point(hash.as_ref().into())
+                        match hash {
+                            Some(h) => ChannelBinding::tls_server_end_point(h),
+                            None => ChannelBinding::none(),
+                        }
                     }),
                 _ => ChannelBinding::none(),
             }
@@ -164,6 +163,17 @@ impl MakeRustlsConnect {
         Self {
             config: Arc::new(config),
         }
+    }
+}
+
+impl Default for MakeRustlsConnect {
+    /// Creates a new `MakeRustlsConnect` using the platform's certificate verifier.
+    fn default() -> Self {
+        use rustls_platform_verifier::ConfigVerifierExt;
+        Self::new(
+            ClientConfig::with_platform_verifier()
+                .expect("failed to build ClientConfig with platform verifier"),
+        )
     }
 }
 
